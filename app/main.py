@@ -108,6 +108,18 @@ from bss.types import (
     UserVoicemailMessageDeleteUnauthorizedErrorResponse,
     UserVoicemailMessageDeleteNotFoundErrorResponse,
     UserVoicemailMessageDeleteInternalServerErrorResponse,
+
+    # call center ("My Queues")
+    CallQueue,
+    UserCallQueuesResponse,
+    UserCallQueuePatch,
+    UserCallQueuesUnauthorizedErrorResponse,
+    UserCallQueuesNotFoundErrorResponse,
+    UserCallQueuesInternalServerErrorResponse,
+    UserCallQueuePatchUnauthorizedErrorResponse,
+    UserCallQueuePatchNotFoundErrorResponse,
+    UserCallQueuePatchInternalServerErrorResponse,
+
     eval_as_bool,
 
     # registration status
@@ -117,6 +129,7 @@ from bss.types import (
     CreateUserEventUnprocessableEntityErrorResponse,
 )
 from bss.types import Capabilities, ExtendedUserInfo, Health, safely_extract_scalar_value
+from metrics import instrument_app, record_deadline_expired, start_metrics_server
 from report_error import WebTritErrorException
 from report_error import raise_webtrit_error
 from request_trace import RouteWithLogging
@@ -135,6 +148,9 @@ app = FastAPI(
     title="Sample adapter for connecting WebTrit to a BSS",
     version=VERSION,
 )
+# Records request rate, latency, status and requests in flight (WT-1718).
+instrument_app(app)
+
 security = HTTPBearer()
 
 router = APIRouter(route_class=RouteWithLogging)
@@ -167,11 +183,18 @@ async def call_bss(fn: Callable, *args, **kwargs):
         try:
             return await asyncio.wait_for(fn(*args, **kwargs), REQUEST_DEADLINE)
         except asyncio.TimeoutError:
+            record_deadline_expired(getattr(fn, "__name__", ""))
             raise_webtrit_error(
                 500,
                 error_message=f"Request to the BSS/VoIP system exceeded the {REQUEST_DEADLINE:.0f}s deadline",
             )
     return await run_in_threadpool(fn, *args, **kwargs)
+
+
+@app.on_event("startup")
+async def _start_metrics_server() -> None:
+    """Expose /metrics on its own port, away from the public ingress."""
+    start_metrics_server(config)
 
 
 @app.on_event("shutdown")
@@ -989,6 +1012,117 @@ async def get_user_voicemail_message_attachment(
     )
 
     return StreamingResponse(content_iterator, media_type=content_type if content_type else "application/octet-stream")
+
+
+@router.get(
+    '/user/queues',
+    response_model=UserCallQueuesResponse,
+    responses={
+        '401': {'model': UserCallQueuesUnauthorizedErrorResponse},
+        '404': {'model': UserCallQueuesNotFoundErrorResponse},
+        '500': {'model': UserCallQueuesInternalServerErrorResponse},
+    },
+    tags=['user'],
+)
+async def get_user_call_queues(
+        auth_data: HTTPAuthorizationCredentials = Depends(security),
+        x_webtrit_tenant_id: Optional[str] = Header(None, alias=TENANT_ID_HTTP_HEADER),
+) -> Union[
+    UserCallQueuesResponse,
+    UserCallQueuesUnauthorizedErrorResponse,
+    UserCallQueuesNotFoundErrorResponse,
+    UserCallQueuesInternalServerErrorResponse,
+]:
+    """
+    Return the call queues the user is assigned to, with their live load.
+
+    An empty list means the user is not a call center agent, so the client should
+    hide the feature for them.
+    """
+    global bss, bss_capabilities
+
+    access_token = auth_data.credentials
+    session = await call_bss(bss.validate_session, access_token)
+
+    is_method_allowed(Capabilities.call_center)
+
+    return await call_bss(bss.retrieve_call_queues, session, ExtendedUserInfo(
+        user_id=safely_extract_scalar_value(session.user_id),
+        tenant_id=bss.default_id_if_none(x_webtrit_tenant_id)
+    ))
+
+
+@router.patch(
+    '/user/queues',
+    response_model=UserCallQueuesResponse,
+    responses={
+        '401': {'model': UserCallQueuePatchUnauthorizedErrorResponse},
+        '404': {'model': UserCallQueuePatchNotFoundErrorResponse},
+        '500': {'model': UserCallQueuePatchInternalServerErrorResponse},
+    },
+    tags=['user'],
+)
+async def patch_user_call_queues(
+        body: UserCallQueuePatch,
+        auth_data: HTTPAuthorizationCredentials = Depends(security),
+        x_webtrit_tenant_id: Optional[str] = Header(None, alias=TENANT_ID_HTTP_HEADER),
+) -> Union[
+    UserCallQueuesResponse,
+    UserCallQueuePatchUnauthorizedErrorResponse,
+    UserCallQueuePatchNotFoundErrorResponse,
+    UserCallQueuePatchInternalServerErrorResponse,
+]:
+    """
+    Log the user in to or out of every call queue they are assigned to.
+    """
+    global bss, bss_capabilities
+
+    access_token = auth_data.credentials
+    session = await call_bss(bss.validate_session, access_token)
+
+    is_method_allowed(Capabilities.call_center)
+
+    return await call_bss(bss.set_all_call_queues_login, session, ExtendedUserInfo(
+        user_id=safely_extract_scalar_value(session.user_id),
+        tenant_id=bss.default_id_if_none(x_webtrit_tenant_id)
+    ), body.logged_in)
+
+
+@router.patch(
+    '/user/queues/{queue_id}',
+    response_model=CallQueue,
+    responses={
+        '401': {'model': UserCallQueuePatchUnauthorizedErrorResponse},
+        '404': {'model': UserCallQueuePatchNotFoundErrorResponse},
+        '500': {'model': UserCallQueuePatchInternalServerErrorResponse},
+    },
+    tags=['user'],
+)
+async def patch_user_call_queue(
+        queue_id: str,
+        body: UserCallQueuePatch,
+        auth_data: HTTPAuthorizationCredentials = Depends(security),
+        x_webtrit_tenant_id: Optional[str] = Header(None, alias=TENANT_ID_HTTP_HEADER),
+) -> Union[
+    CallQueue,
+    UserCallQueuePatchUnauthorizedErrorResponse,
+    UserCallQueuePatchNotFoundErrorResponse,
+    UserCallQueuePatchInternalServerErrorResponse,
+]:
+    """
+    Log the user in to or out of a single call queue.
+    """
+    global bss, bss_capabilities
+
+    access_token = auth_data.credentials
+    session = await call_bss(bss.validate_session, access_token)
+
+    is_method_allowed(Capabilities.call_center)
+
+    return await call_bss(bss.set_call_queue_login, session, ExtendedUserInfo(
+        user_id=safely_extract_scalar_value(session.user_id),
+        tenant_id=bss.default_id_if_none(x_webtrit_tenant_id)
+    ), queue_id, body.logged_in)
 
 
 @router.post(

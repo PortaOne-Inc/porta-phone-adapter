@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 import uuid
 from inspect import isawaitable
 from datetime import datetime, timedelta, UTC
@@ -35,6 +36,8 @@ from bss.types import (
     UserVoicemailsResponse,
     UserVoicemailMessagePatch,
     VoicemailMessageDetails,
+    CallQueue,
+    UserCallQueuesResponse,
     UserEventGroup,
     UserEventType,
 )
@@ -63,6 +66,7 @@ from .exceptions import (
     addon_required_error,
     session_upgrade_needed_error,
     voicemail_not_configured,
+    not_found_call_queue_error,
 )
 from .serializer import Serializer
 from .types import (
@@ -78,9 +82,101 @@ from .utils import generate_otp_id, extract_fault_code, generate_hash_dictionary
 
 PORTASWITCH_VERSION_WITH_TOKEN: Final[str] = "MR128"
 
+#: str: Raised by CallControl.get_sip_calls_list when the API session has no call state
+#: subscription for the requested scope yet.
+CALL_CONTROL_NOT_SUBSCRIBED_FAULT: Final[str] = "Server.CallControl.sip.disabled_api_notifications"
+
+#: tuple: Fault codes that mean the caller's PortaBilling access token is no longer usable.
+EXPIRED_TOKEN_FAULTS: Final[tuple] = ("Client.Session.check_auth.failed_to_process_access_token",)
+
+#: int: Upper bound on the per-process call queue counter cache, so a switch with many
+#: customers cannot grow it without limit.
+CALL_QUEUE_COUNTERS_CACHE_MAX: Final[int] = 512
+
+#: int: Page size for reading hunt groups. PortaBilling caps list methods server-side,
+#: so the list has to be paged or queues past the cap would silently disappear from the
+#: agent's screen - and, worse, from the membership check behind log in / log out.
+HUNTGROUP_PAGE_LIMIT: Final[int] = 500
+
+#: int: Safety bound on hunt group paging, so a switch answering oddly cannot spin here.
+HUNTGROUP_MAX_PAGES: Final[int] = 20
+
+#: int: Seconds to reuse the live "callers waiting" counters before asking the switch
+#: again. The clients poll the queue list while the screen is open, so without this a
+#: room full of agents would multiply the load on the switch by the number of open
+#: screens. Sized to cover the 5-10s client poll interval.
+CALL_QUEUE_COUNTERS_TTL: Final[int] = 5
+
+#: object: Sentinel telling "nothing usable in the cache" apart from a cached None,
+#: which legitimately means "the counters are unknown for this customer right now".
+_COUNTERS_CACHE_MISS: Final = object()
+
 #: Default fan-out concurrency for parallel PortaSwitch API calls (replaces the
 #: former ThreadPoolExecutor(max_workers=10) pools). WT-1720.
 FANOUT_LIMIT: Final[int] = 10
+
+#: Fields of a PortaBilling account record that the contacts path reads — the
+#: local filter, the serializer, and the alias/master lookups. The full record
+#: has 57 fields and costs ~2.9 KB per account as Python objects against ~0.5 KB
+#: for this projection, and the lists being cached run to thousands of rows
+#: (WT-1922). Anything added to Serializer.get_contact_info_by_account has to be
+#: added here too; test_37 fails if the two drift apart.
+ACCOUNT_CACHE_FIELDS: Final[tuple] = (
+    "i_account", "i_customer", "id", "firstname", "lastname", "companyname",
+    "email", "extension_id", "extension_name", "sip_status", "status",
+    "dual_version_system", "did_number", "i_master_account",
+)
+
+#: Nested lists worth keeping, trimmed to the single key each consumer reads.
+ACCOUNT_CACHE_LIST_FIELDS: Final[dict] = {
+    "alias_list": "id",
+    "alias_did_number_list": "did_number",
+}
+
+#: Past this multiple of CONTACTS_CACHE_TTL an entry is too old to serve at all,
+#: so the caller waits for a fresh read rather than being handed stale contacts.
+ACCOUNTS_CACHE_STALE_FACTOR: Final[int] = 10
+
+#: Ceiling on cached rows across all customers, ~0.5 KB each after projection.
+#: Deliberately not configurable — the `evicted` counter says if it ever bites.
+ACCOUNTS_CACHE_MAX_ROWS: Final[int] = 100_000
+
+
+def _record_cache_event(event: str) -> None:
+    """Count one account-list cache outcome (WT-1922).
+
+    Imported lazily, like the pool-timeout counter, so this adapter keeps working
+    and stays importable on its own when the metrics stack is unavailable.
+    """
+    try:
+        from metrics import record_contacts_cache
+
+        record_contacts_cache(event)
+    except Exception as e:
+        logging.debug(f"Could not record a contacts cache event: {e}")
+
+
+def _project_account(account: dict) -> dict:
+    """Reduce an account record to the fields the contacts path consumes.
+
+    Absent fields stay absent, and the two nested lists are always present as
+    lists: every consumer reads them through ``.get(..., [])``, so an empty list
+    and a missing key are the same to them.
+
+    One deliberate difference from the uncached path: a nested row missing the
+    key that is kept is dropped here, where the serializer would have indexed it
+    and raised. A malformed row therefore costs one number instead of the whole
+    request — better, but it does mean the cached and live answers are not
+    identical for that input.
+    """
+    projected = {key: account[key] for key in ACCOUNT_CACHE_FIELDS if key in account}
+    for field, kept in ACCOUNT_CACHE_LIST_FIELDS.items():
+        projected[field] = [
+            {kept: row[kept]}
+            for row in account.get(field) or []
+            if isinstance(row, dict) and kept in row
+        ]
+    return projected
 
 
 async def _gather_limited(coros: List[Awaitable], limit: int = FANOUT_LIMIT,
@@ -112,7 +208,7 @@ class PortaSwitchAdapter(BSSAdapter):
     capabilities required by WebTrit clients.
     """
 
-    VERSION: Final[str] = "1.1.0"
+    VERSION: Final[str] = "1.1.3"
     OTP_DELIVERY_CHANNEL: Final[DeliveryChannel] = DeliveryChannel.email
     OTP_LOGIN_IDENTIFIERS = ('phone_number',)
     CAPABILITIES: Final[Capabilities] = [
@@ -129,7 +225,17 @@ class PortaSwitchAdapter(BSSAdapter):
         Capabilities.notifications,
         Capabilities.notifications_push,
         Capabilities.sip_presence,
-        Capabilities.sip_dialogs
+        Capabilities.sip_dialogs,
+        # Merging calls into a conference happens entirely in Core and Janus -
+        # nothing is signalled to PortaSwitch - so this only tells the client
+        # whether the deployment offers it (WT-783).
+        Capabilities.conference,
+        # Muting one conversation is stored and enforced by Core alone - PortaSwitch
+        # knows nothing about it - so this only tells the client whether the deployment
+        # is new enough to offer it (WT-1880).
+        Capabilities.conversation_mute,
+        # "My Queues" call center screen (WT-1881).
+        Capabilities.call_center,
     ]
 
     def __init__(self, config: AppConfig):
@@ -176,9 +282,38 @@ class PortaSwitchAdapter(BSSAdapter):
             host=self._portaswitch_settings.SIP_SERVER_HOST, port=self._portaswitch_settings.SIP_SERVER_PORT
         )
 
+        self._init_call_queue_state()
+        self._init_contacts_cache_state()
+
         self._otp_storage = configure_otp_storage(self._otp_settings)
         self._cached_capabilities = self.calculate_capabilities()
         self._hash_dictionary = generate_hash_dictionary() if self._settings.ENABLE_ON_DEMAND_SESSION_MIGRATION else {}
+
+    def _init_call_queue_state(self) -> None:
+        """Sets up the per-process state behind the "My Queues" screen (WT-1881).
+
+        Its own method so tests that bypass __init__ still go through the real
+        initialisation instead of hand-rolling equivalent attributes.
+        """
+        # Live call queue counters per customer: i_customer -> (monotonic ts, waiting map
+        # or None). The clients poll the queue list while the screen is open.
+        self._call_queue_counters_cache: Dict[int, tuple] = {}
+        # One lock per customer so a burst of polls costs one switch request, not N.
+        self._call_queue_counters_locks: Dict[int, asyncio.Lock] = {}
+
+    def _init_contacts_cache_state(self) -> None:
+        """Sets up the account-list cache behind contacts (WT-1922).
+
+        Its own method for the same reason as _init_call_queue_state: tests that
+        bypass __init__ still get the real attributes.
+        """
+        # i_customer -> (monotonic ts, projected account list).
+        self._accounts_cache: Dict[int, tuple] = {}
+        # One lock per customer, so a burst of contacts requests costs one read.
+        self._accounts_cache_locks: Dict[int, asyncio.Lock] = {}
+        # In-flight background refreshes, kept referenced: the event loop only
+        # holds a weak reference to a task.
+        self._accounts_refresh_tasks: Dict[int, asyncio.Task] = {}
 
     @classmethod
     def name(cls) -> str:
@@ -349,7 +484,7 @@ class PortaSwitchAdapter(BSSAdapter):
 
             raise error
 
-    def validate_session(self, access_token: str) -> SessionInfo:
+    async def validate_session(self, access_token: str) -> SessionInfo:
         """Validates whether the provided access token is still valid.
 
         Parameters:
@@ -363,15 +498,32 @@ class PortaSwitchAdapter(BSSAdapter):
         """
         try:
             data = self._account_api.decode_and_verify_access_token_expiration(access_token)
-            user_id = str(data["i_account"])
-
-            return SessionInfo(user_id=UserId(user_id), access_token=AccessToken(access_token))
         except ExpiredSignatureError:
             raise access_token_expired_error()
         except JWTError:
             if self._settings.ENABLE_ON_DEMAND_SESSION_MIGRATION:
                 raise session_upgrade_needed_error()
             raise access_token_invalid_error()
+
+        user_id = data.get("i_account")
+        if user_id is None:
+            # Tokens minted via Session/login_to_realm (e.g. an embedded page
+            # logging the account in through the admin realm) carry no i_account
+            # claim, so the JWT alone cannot identify the session owner. Resolve
+            # it server-side via Session/ping, as pre-1.x versions did (WT-1900).
+            try:
+                session_data = await self._account_api.ping(access_token=access_token)
+            except WebTritErrorException as error:
+                if extract_fault_code(error) == "Client.Session.ping.failed_to_process_access_token":
+                    raise access_token_invalid_error()
+
+                raise error
+
+            user_id = session_data.get("user_id")
+            if not user_id:
+                raise access_token_invalid_error()
+
+        return SessionInfo(user_id=UserId(str(user_id)), access_token=AccessToken(access_token))
 
     async def refresh_session(self, refresh_token: str) -> SessionInfo:
         """Refreshes the PortaSwitch account session.
@@ -1574,6 +1726,313 @@ class PortaSwitchAdapter(BSSAdapter):
         # PortaSwitch accounts cannot be deleted via the Adapter.
         pass
 
+    # region call center - "My Queues" (WT-1881)
+
+    @staticmethod
+    def _call_center_error(error: WebTritErrorException) -> WebTritErrorException:
+        """Maps a PortaSwitch fault raised by a call center call to a domain error.
+
+        Errors raised by the adapter itself (the membership 404, the read-only guard)
+        carry no PortaSwitch fault and are passed through untouched.
+        """
+        try:
+            fault_code = extract_fault_code(error)
+        except WebTritErrorException:
+            return error
+
+        return access_token_expired_error() if fault_code in EXPIRED_TOKEN_FAULTS else error
+
+    async def _load_account_context(self, session: SessionInfo) -> dict:
+        """Returns the account_info of the session owner (i_account, i_customer, id)."""
+        access_token = safely_extract_scalar_value(session.access_token)
+        return (await self._account_api.get_account_info(access_token=access_token))["account_info"]
+
+    async def _load_agent_queues(self, account_info: dict) -> List[dict]:
+        """Returns the hunt groups that have a call queue and include this agent.
+
+        Read through the admin realm on purpose: the account realm returns only the
+        caller's own membership row and strips account_id/id/name from it, so the
+        per-queue agent counters cannot be built there (WT-1881).
+        """
+        agent_account_id = account_info["id"]
+        return [
+            huntgroup for huntgroup in await self._read_huntgroups(account_info["i_customer"])
+            if Serializer.is_call_queue(huntgroup)
+            and Serializer.is_huntgroup_member(huntgroup, agent_account_id)
+        ]
+
+    async def _read_huntgroups(self, i_customer: int) -> List[dict]:
+        """Reads every hunt group of a customer, one page at a time."""
+        huntgroups: List[dict] = []
+        offset = 0
+
+        for _ in range(HUNTGROUP_MAX_PAGES):
+            response = await self._admin_api.get_huntgroup_list(
+                i_customer, limit=HUNTGROUP_PAGE_LIMIT, offset=offset
+            )
+            page = response.get("huntgroup_list") or []
+            huntgroups.extend(page)
+
+            total = response.get("total")
+            if len(page) < HUNTGROUP_PAGE_LIMIT:
+                break
+            if total is not None and len(huntgroups) >= int(total):
+                break
+
+            offset += HUNTGROUP_PAGE_LIMIT
+        else:
+            logging.warning(
+                f"Stopped paging hunt groups for i_customer={i_customer} after "
+                f"{HUNTGROUP_MAX_PAGES} pages; the queue list may be incomplete"
+            )
+
+        return huntgroups
+
+    async def _fetch_callers_waiting(self, i_customer: int) -> Optional[Dict[str, int]]:
+        """Returns hunt group number -> callers waiting, or None when unavailable.
+
+        None and an empty dict mean different things: None is "we do not know" (Call
+        Control unreachable, or the call state subscription was only just created and
+        has not caught up), and surfaces as a null in the API; an empty dict means the
+        switch answered and nobody is queued.
+        """
+        cached = self._cached_callers_waiting(i_customer)
+        if cached is not _COUNTERS_CACHE_MISS:
+            return cached
+
+        # When a shift starts and every agent opens the screen at once, only the first
+        # request reaches the switch; the rest wait here and read what it cached.
+        async with self._counters_lock(i_customer):
+            cached = self._cached_callers_waiting(i_customer)
+            if cached is not _COUNTERS_CACHE_MISS:
+                return cached
+
+            waiting = await self._read_callers_waiting(i_customer)
+            # Failures are cached too: on an installation without Call Control access
+            # every poll would otherwise cost two failing requests and a warning.
+            self._store_callers_waiting(i_customer, waiting)
+            return waiting
+
+    async def _read_callers_waiting(self, i_customer: int) -> Optional[Dict[str, int]]:
+        """One attempt at the live counters. None when the answer cannot be trusted."""
+        try:
+            calls_list, subscription_created = await self._get_sip_calls_list(i_customer)
+        except WebTritErrorException as error:
+            # A missing Call Control permission or an unreachable switch must not take
+            # the whole queue list down - the counters are the optional part.
+            logging.warning(f"Call queue counters unavailable for i_customer={i_customer}: {error}")
+            return None
+
+        if subscription_created:
+            # PortaSIP tracks call state from the moment of subscription, so the first
+            # read after (re)subscribing cannot see calls that were already queued.
+            # Report "unknown" instead of a confident zero.
+            return None
+
+        return Serializer.count_callers_waiting(calls_list)
+
+    def _cached_callers_waiting(self, i_customer: int):
+        """Returns the cached counters, or _COUNTERS_CACHE_MISS when there are none."""
+        entry = self._call_queue_counters_cache.get(i_customer)
+        if entry and (time.monotonic() - entry[0]) < CALL_QUEUE_COUNTERS_TTL:
+            return entry[1]
+
+        return _COUNTERS_CACHE_MISS
+
+    def _store_callers_waiting(self, i_customer: int, waiting: Optional[Dict[str, int]]) -> None:
+        """Caches the counters (including a failed lookup) for the configured TTL."""
+        cache = self._call_queue_counters_cache
+        cache[i_customer] = (time.monotonic(), waiting)
+
+        if len(cache) > CALL_QUEUE_COUNTERS_CACHE_MAX:
+            stalest = sorted(cache, key=lambda key: cache[key][0])
+            for key in stalest[:len(cache) - CALL_QUEUE_COUNTERS_CACHE_MAX]:
+                cache.pop(key, None)
+
+    def _counters_lock(self, i_customer: int) -> asyncio.Lock:
+        """The single-flight lock for one customer's counters."""
+        locks = self._call_queue_counters_locks
+        lock = locks.get(i_customer)
+        if lock is None:
+            lock = locks[i_customer] = asyncio.Lock()
+            if len(locks) > CALL_QUEUE_COUNTERS_CACHE_MAX:
+                for key in [k for k, v in locks.items() if k != i_customer and not v.locked()]:
+                    locks.pop(key, None)
+        return lock
+
+    async def _get_sip_calls_list(self, i_customer: int) -> tuple:
+        """Reads the calls in progress, (re)creating the call state subscription if needed.
+
+        Returns (calls_list, subscription_created). The subscription is bound to the admin
+        API session, so it is lost whenever that session is re-established; recreate it on
+        demand rather than at startup. A second failure is not retried - it propagates and
+        the counters degrade to "unknown".
+        """
+        try:
+            result = await self._admin_api.get_sip_calls_list(i_customer)
+            return result.get("calls_list") or [], False
+        except WebTritErrorException as error:
+            if extract_fault_code(error) != CALL_CONTROL_NOT_SUBSCRIBED_FAULT:
+                raise
+
+        logging.info(f"Subscribing the admin session to call state notifications for {i_customer}")
+        await self._admin_api.enable_api_notifications(i_customer)
+        result = await self._admin_api.get_sip_calls_list(i_customer)
+        return result.get("calls_list") or [], True
+
+    def _build_queues(self, huntgroups: List[dict], agent_account_id: str,
+                      waiting: Optional[Dict[str, int]]) -> List[CallQueue]:
+        """Turns raw hunt groups into the API representation."""
+        if waiting and huntgroups and not any(hg["id"] in waiting for hg in huntgroups):
+            # Both sides are stringly typed: the counters are keyed by the CallControl
+            # callee.huntgroup_id and looked up by the hunt group id. If those namespaces
+            # ever diverge, every queue would silently report 0 - say so instead.
+            logging.warning(
+                "Call queue counters match none of the agent's queues "
+                f"(queued hunt groups: {sorted(waiting)}, agent queues: "
+                f"{[hg['id'] for hg in huntgroups]})"
+            )
+
+        return [
+            Serializer.get_call_queue(
+                huntgroup,
+                agent_account_id,
+                None if waiting is None else waiting.get(huntgroup["id"], 0),
+            )
+            for huntgroup in huntgroups
+        ]
+
+    async def retrieve_call_queues(self, session: SessionInfo, user: UserInfo) -> UserCallQueuesResponse:
+        """Returns the call queues this agent is assigned to, with their live load.
+
+        Parameters:
+            session (SessionInfo): The session of the PortaSwitch account.
+            user (UserInfo): The information about the PortaSwitch account.
+
+        Returns:
+            UserCallQueuesResponse: The agent's queues. Empty when the user is not a
+                call center agent, which is how the clients decide to hide the screen.
+
+        Raises:
+            WebTritErrorException: If the session is invalid or PortaSwitch fails.
+        """
+        try:
+            account_info = await self._load_account_context(session)
+            huntgroups = await self._load_agent_queues(account_info)
+            waiting = await self._fetch_callers_waiting(account_info["i_customer"])
+
+            return UserCallQueuesResponse(
+                items=self._build_queues(huntgroups, account_info["id"], waiting)
+            )
+        except WebTritErrorException as error:
+            raise self._call_center_error(error)
+
+    async def set_call_queue_login(self, session: SessionInfo, user: UserInfo,
+                                   queue_id: str, logged_in: bool) -> CallQueue:
+        """Logs the agent in to / out of a single call queue.
+
+        Parameters:
+            session (SessionInfo): The session of the PortaSwitch account.
+            user (UserInfo): The information about the PortaSwitch account.
+            queue_id (str): The hunt group number of the queue.
+            logged_in (bool): True to log in, False to log out.
+
+        Returns:
+            CallQueue: The queue with its state after the change.
+
+        Raises:
+            WebTritErrorException: If the agent is not a member of that queue, the
+                session is invalid, or PortaSwitch fails.
+        """
+        try:
+            account_info = await self._load_account_context(session)
+            huntgroups = await self._load_agent_queues(account_info)
+
+            if not any(huntgroup["id"] == queue_id for huntgroup in huntgroups):
+                # The subscription update runs under the admin session, which may touch any
+                # hunt group, so membership has to be enforced here rather than by PortaSwitch.
+                raise not_found_call_queue_error(queue_id)
+
+            await self._update_subscription(account_info["i_account"], [queue_id], logged_in)
+
+            huntgroups = await self._load_agent_queues(account_info)
+            waiting = await self._fetch_callers_waiting(account_info["i_customer"])
+            queues = self._build_queues(huntgroups, account_info["id"], waiting)
+
+            queue = next((item for item in queues if item.id == queue_id), None)
+            if queue is None:
+                # The queue is gone from the agent's list right after the update. Report
+                # it as such: a bare next() would raise StopIteration, which asyncio turns
+                # into an opaque RuntimeError that no error handler here would recognise.
+                logging.warning(f"Call queue {queue_id} disappeared right after updating its subscription")
+                raise not_found_call_queue_error(queue_id)
+
+            self._warn_on_unapplied_subscription([queue], logged_in)
+            return queue
+        except WebTritErrorException as error:
+            raise self._call_center_error(error)
+
+    async def set_all_call_queues_login(self, session: SessionInfo, user: UserInfo,
+                                        logged_in: bool) -> UserCallQueuesResponse:
+        """Logs the agent in to / out of every call queue they are assigned to.
+
+        Parameters:
+            session (SessionInfo): The session of the PortaSwitch account.
+            user (UserInfo): The information about the PortaSwitch account.
+            logged_in (bool): True to log in to all queues, False to log out of all.
+
+        Returns:
+            UserCallQueuesResponse: The agent's queues with their state after the change.
+
+        Raises:
+            WebTritErrorException: If the session is invalid or PortaSwitch fails.
+        """
+        try:
+            account_info = await self._load_account_context(session)
+            huntgroups = await self._load_agent_queues(account_info)
+
+            queue_ids = [huntgroup["id"] for huntgroup in huntgroups]
+            if queue_ids:
+                # PortaSwitch accepts the whole list in one request, so this stays a
+                # single switch call no matter how many queues the agent serves.
+                await self._update_subscription(account_info["i_account"], queue_ids, logged_in)
+                huntgroups = await self._load_agent_queues(account_info)
+
+            waiting = await self._fetch_callers_waiting(account_info["i_customer"])
+            queues = self._build_queues(huntgroups, account_info["id"], waiting)
+
+            if queue_ids:
+                self._warn_on_unapplied_subscription(queues, logged_in)
+
+            return UserCallQueuesResponse(items=queues)
+        except WebTritErrorException as error:
+            raise self._call_center_error(error)
+
+    @staticmethod
+    def _warn_on_unapplied_subscription(queues: List[CallQueue], logged_in: bool) -> None:
+        """Logs when the switch reported success but the state did not actually change.
+
+        update_huntgroups_subscription answers {"success": 1} regardless, so a wrong
+        request shape (hunt groups are addressed by their string id, not by i_c_group)
+        would look like a silent no-op without this.
+        """
+        unapplied = [queue.id for queue in queues if queue.logged_in != logged_in]
+        if unapplied:
+            logging.warning(
+                f"Hunt group subscription reported success but logged_in is still "
+                f"{not logged_in} for {unapplied}"
+            )
+
+    async def _update_subscription(self, i_account: int, queue_ids: List[str], logged_in: bool) -> None:
+        """Applies a hunt group subscription change for the agent."""
+        await self._admin_api.update_huntgroups_subscription(
+            i_account=i_account,
+            subscribe=queue_ids if logged_in else None,
+            unsubscribe=None if logged_in else queue_ids,
+        )
+
+    # endregion
+
     async def custom_method_public(
             self,
             method_name: str,
@@ -1802,6 +2261,148 @@ class PortaSwitchAdapter(BSSAdapter):
             return main_i_customer, [main_i_customer]
 
     async def _get_all_accounts_by_customer(self, i_customer: int, **search_params) -> list[dict]:
+        """All accounts of a customer, served from the cache when one is enabled.
+
+        Without a cache every contacts request re-reads the whole list from the
+        switch, which is what saturated the connection pool in WT-1922. With
+        CONTACTS_CACHE_TTL set, that read happens once per TTL per customer no
+        matter how many requests arrive.
+
+        Search results are never cached: they are already bounded to the page
+        being asked for, and their key space (field x pattern) is unbounded.
+        """
+        ttl = self._portaswitch_settings.CONTACTS_CACHE_TTL
+        if ttl <= 0 or search_params:
+            return await self._fetch_accounts_by_customer(i_customer, **search_params)
+
+        entry = self._accounts_cache.get(i_customer)
+        if entry is not None:
+            age = time.monotonic() - entry[0]
+            if age < ttl:
+                _record_cache_event("hit")
+                return entry[1]
+            if age < ttl * ACCOUNTS_CACHE_STALE_FACTOR:
+                # Hand back what we have and re-read behind the request: making a
+                # burst of clients wait on one slow read of the whole list is how
+                # the deadline cancellations of WT-1922 got started.
+                _record_cache_event("stale")
+                self._schedule_accounts_refresh(i_customer)
+                return entry[1]
+
+        return await self._read_accounts_into_cache(i_customer)
+
+    async def _read_accounts_into_cache(self, i_customer: int) -> list[dict]:
+        """Read one customer's accounts under a per-customer lock and cache them.
+
+        The lock is the single-flight: concurrent callers wait for the first read
+        instead of each starting their own, and re-check the cache afterwards.
+        """
+        lock = self._accounts_cache_locks.setdefault(i_customer, asyncio.Lock())
+        async with lock:
+            ttl = self._portaswitch_settings.CONTACTS_CACHE_TTL
+            entry = self._accounts_cache.get(i_customer)
+            if entry is not None and (time.monotonic() - entry[0]) < ttl:
+                # Someone read it while we waited: counted apart from `hit` so
+                # that `miss` stays "requests that actually waited on a read".
+                _record_cache_event("coalesced")
+                return entry[1]
+
+            _record_cache_event("miss")
+            accounts = [
+                _project_account(account)
+                for account in await self._fetch_accounts_by_customer(i_customer)
+            ]
+            self._store_accounts(i_customer, accounts)
+            return accounts
+
+    def _schedule_accounts_refresh(self, i_customer: int) -> None:
+        """Start a background re-read of one customer's accounts, at most one.
+
+        A detached task on purpose: ``asyncio.wait_for`` in ``call_bss`` cancels
+        the request's own task tree, and a task started with ``create_task`` is
+        not part of it — so the refresh survives the deadline of whichever
+        request happened to trigger it.
+        """
+        task = self._accounts_refresh_tasks.get(i_customer)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no loop: nothing to schedule onto
+            return
+        task = loop.create_task(self._refresh_accounts(i_customer))
+        self._accounts_refresh_tasks[i_customer] = task
+        task.add_done_callback(
+            lambda finished, customer=i_customer: self._forget_refresh_task(customer, finished)
+        )
+
+    def _forget_refresh_task(self, i_customer: int, finished: asyncio.Task) -> None:
+        """Drop a finished refresh task, but only if it is still the current one.
+
+        A callback on an already-finished task runs via call_soon, so another
+        coroutine can schedule a replacement first; popping blindly would delete
+        that replacement and drop the strong reference the loop does not hold.
+        """
+        if self._accounts_refresh_tasks.get(i_customer) is finished:
+            del self._accounts_refresh_tasks[i_customer]
+
+    async def _refresh_accounts(self, i_customer: int) -> None:
+        """Re-read one customer's accounts in the background.
+
+        Every failure keeps the existing entry: a switch hiccup must not turn a
+        list we could still serve into an error for every client. Exceptions are
+        swallowed here rather than left on the task, which would only surface as
+        "Task exception was never retrieved".
+        """
+        try:
+            await self._read_accounts_into_cache(i_customer)
+            _record_cache_event("refresh")
+        except Exception as e:
+            _record_cache_event("refresh_failed")
+            logging.warning(
+                f"Failed to refresh the cached account list for i_customer={i_customer}: {e}"
+            )
+
+    def _store_accounts(self, i_customer: int, accounts: list[dict]) -> None:
+        self._accounts_cache[i_customer] = (time.monotonic(), accounts)
+        self._evict_accounts_over_limit(i_customer)
+
+    def _evict_accounts_over_limit(self, just_stored: int) -> None:
+        """Drop the oldest entries until the cached row count is back in bounds.
+
+        The entry just stored is never the one dropped: a customer larger than
+        the whole budget is served rather than re-read on every request, which
+        would be the exact behaviour the cache exists to remove.
+        """
+        total = sum(len(cached) for _, cached in self._accounts_cache.values())
+        while total > ACCOUNTS_CACHE_MAX_ROWS and len(self._accounts_cache) > 1:
+            oldest = min(
+                (customer for customer in self._accounts_cache if customer != just_stored),
+                key=lambda customer: self._accounts_cache[customer][0],
+                default=None,
+            )
+            if oldest is None:
+                break
+            freed = len(self._accounts_cache[oldest][1])
+            if not freed:
+                # An empty entry frees nothing; carrying on would delete every
+                # other customer to no effect.
+                break
+            total -= freed
+            del self._accounts_cache[oldest]
+            lock = self._accounts_cache_locks.get(oldest)
+            if lock is not None and not lock.locked():
+                # Bounded alongside the entry it guarded; a held lock is left to
+                # its holder, which will simply repopulate the entry.
+                del self._accounts_cache_locks[oldest]
+            _record_cache_event("evicted")
+        if total > ACCOUNTS_CACHE_MAX_ROWS:
+            logging.warning(
+                f"Cached account rows ({total}) exceed the {ACCOUNTS_CACHE_MAX_ROWS} budget "
+                f"with i_customer={just_stored} alone; lower CONTACTS_CACHE_TTL or the fan-out"
+            )
+
+    async def _fetch_accounts_by_customer(self, i_customer: int, **search_params) -> list[dict]:
         """Fetch all accounts for a customer using parallel pagination.
 
         Parameters:
