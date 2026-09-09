@@ -1,0 +1,27 @@
+{
+  "comments": [
+    {
+      "unresolved": true,
+      "key": {
+        "uuid": "4fa70030_abd6009e",
+        "filename": "/COMMIT_MSG",
+        "patchSetId": 1
+      },
+      "lineNbr": 7,
+      "author": {
+        "id": 690
+      },
+      "writtenOn": "2026-09-09T12:53:36Z",
+      "side": 1,
+      "message": "Please follow the standard. It should be:\n\nWT-1939 Detect call recordings by cr_download_ids",
+      "range": {
+        "startLine": 7,
+        "startChar": 0,
+        "endLine": 7,
+        "endChar": 69
+      },
+      "revId": "df9fdb502ba0958fd7c0ac3a5d05a092ef61fd98",
+      "serverId": "b3d83be1-eb64-49fe-9bf1-b81a817d2fd2"
+    }
+  ]
+}
