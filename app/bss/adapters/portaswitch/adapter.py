@@ -236,7 +236,20 @@ class PortaSwitchAdapter(BSSAdapter):
         Capabilities.conversation_mute,
         # "My Queues" call center screen (WT-1881).
         Capabilities.call_center,
+        # Keeping a voicemail message is the IMAP \Flagged flag on the mailbox
+        # message, so this one is genuinely backed by PortaSwitch (WT-1878).
+        Capabilities.voicemail_save,
+        # The mailbox has no trash and no forward API. Both are implemented and
+        # stored by Core alone - PortaSwitch knows nothing about them - so these
+        # only tell the client whether the deployment offers them (WT-1878).
+        Capabilities.voicemail_trash,
+        Capabilities.voicemail_forward,
     ]
+    # Which mailbox flag backs each patchable voicemail attribute (WT-1878).
+    VOICEMAIL_PATCH_FLAGS: Final[dict[str, PortaSwitchMailboxMessageFlag]] = {
+        "seen": PortaSwitchMailboxMessageFlag.SEEN,
+        "saved": PortaSwitchMailboxMessageFlag.FLAGGED,
+    }
 
     def __init__(self, config: AppConfig):
         super().__init__(config)
@@ -1605,28 +1618,44 @@ class PortaSwitchAdapter(BSSAdapter):
     ) -> UserVoicemailMessagePatch:
         """Update attributes for a user's voicemail message.
 
+        Only the attributes present in the request are applied. `seen` and `saved` are
+        the IMAP \\Seen and \\Flagged flags on the mailbox message, and each is set or
+        cleared with its own PortaBilling call, so an omitted attribute must be skipped
+        rather than sent as false - a patch that only saves a message must not also mark
+        it unseen (WT-1878).
+
         Parameters:
             session (SessionInfo): The session of the PortaSwitch account.
             message_id (str): The unique ID of the voicemail message.
-            body (UserVoicemailMessagePatch): Attributes to update (e.g., seen status).
+            body (UserVoicemailMessagePatch): Attributes to update (`seen`, `saved`).
 
         Returns:
-            UserVoicemailMessagePatch: The updated message attributes.
+            UserVoicemailMessagePatch: The attributes that were changed, and only those.
 
         Raises:
             WebTritErrorException: If the user is not found or the session is invalid.
         """
-        seen = body.seen
+        # `seen=False` is a request to clear the flag, while an absent `seen` is a
+        # request to leave it as it is - so presence decides, not truthiness.
+        # exclude_none as well as exclude_unset: an explicit null is "not specified"
+        # too. Clients that serialise unset optionals as null are common, and reading
+        # such a null as false would silently destroy the flag it did not mention.
+        requested = body.model_dump(exclude_unset=True, exclude_none=True)
 
         try:
-            await self._account_api.set_mailbox_message_flag(
-                safely_extract_scalar_value(session.access_token),
-                message_id,
-                PortaSwitchMailboxMessageFlag.SEEN,
-                PortaSwitchMailboxMessageFlagAction.SET if seen else PortaSwitchMailboxMessageFlagAction.UNSET,
-            )
+            for attribute, flag in self.VOICEMAIL_PATCH_FLAGS.items():
+                if attribute not in requested:
+                    continue
 
-            return UserVoicemailMessagePatch(seen=seen)
+                await self._account_api.set_mailbox_message_flag(
+                    safely_extract_scalar_value(session.access_token),
+                    message_id,
+                    flag,
+                    PortaSwitchMailboxMessageFlagAction.SET if requested[attribute]
+                    else PortaSwitchMailboxMessageFlagAction.UNSET,
+                )
+
+            return UserVoicemailMessagePatch(**requested)
 
         except WebTritErrorException as error:
             fault_code = extract_fault_code(error)
