@@ -103,6 +103,7 @@ from bss.types import (
     UserVoicemailMessageAttachmentInternalServerErrorResponse,
     UserVoicemailMessagePatchUnauthorizedErrorResponse,
     UserVoicemailMessagePatchNotFoundErrorResponse,
+    UserVoicemailMessagePatchNotImplementedErrorResponse,
     UserVoicemailMessageAttachmentUnprocessableEntityErrorResponse,
     UserVoicemailMessagePatchInternalServerErrorResponse,
     UserVoicemailMessageDeleteUnauthorizedErrorResponse,
@@ -918,10 +919,20 @@ async def get_user_voicemail_message_details(
 @router.patch(
     '/user/voicemails/{message_id}',
     response_model=UserVoicemailMessagePatch,
+    # Only the attributes that were sent come back, so the caller can tell what actually
+    # changed and an omitted attribute is never echoed as null (WT-1878).
+    response_model_exclude_none=True,
+    description=(
+        'Change attributes of a single voicemail message. Only the attributes present in '
+        'the request are applied: an attribute that is omitted - or sent as `null` - is '
+        'left as it is.\n\n'
+        '`saved` requires the `voicemailSave` functionality.'
+    ),
     responses={
         '401': {'model': UserVoicemailMessagePatchUnauthorizedErrorResponse},
         '404': {'model': UserVoicemailMessagePatchNotFoundErrorResponse},
         '500': {'model': UserVoicemailMessagePatchInternalServerErrorResponse},
+        '501': {'model': UserVoicemailMessagePatchNotImplementedErrorResponse},
     },
     tags=['user'],
 )
@@ -935,6 +946,7 @@ async def patch_user_voicemail_message(
     UserVoicemailMessagePatchUnauthorizedErrorResponse,
     UserVoicemailMessagePatchNotFoundErrorResponse,
     UserVoicemailMessagePatchInternalServerErrorResponse,
+    UserVoicemailMessagePatchNotImplementedErrorResponse,
 ]:
     global bss, bss_capabilities
 
@@ -942,6 +954,10 @@ async def patch_user_voicemail_message(
     session = await call_bss(bss.validate_session, access_token)
 
     is_method_allowed(Capabilities.voicemail)
+    # `saved: null` changes nothing, so it must not be refused as an unsupported
+    # functionality either.
+    if body.saved is not None:
+        is_method_allowed(Capabilities.voicemail_save)
 
     return await call_bss(bss.patch_voicemail_message, session, message_id, body)
 

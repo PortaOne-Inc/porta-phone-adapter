@@ -152,7 +152,16 @@ class BSSAdapter(SessionManagement, OTPHandler,
         CONFERENCE=dict(default=False, option=Capabilities.conference),
         CONVERSATION_MUTE=dict(default=True, option=Capabilities.conversation_mute),
         CALL_CENTER=dict(default=False, option=Capabilities.call_center),
+        VOICEMAIL_FORWARD=dict(default=True, option=Capabilities.voicemail_forward),
     )
+    # Capabilities that only mean anything alongside another one. Advertising
+    # `voicemailSave` on a deployment whose voicemail screen is switched off would
+    # describe a control the client can never reach (WT-1878).
+    CAPABILITY_DEPENDENCIES = {
+        Capabilities.voicemail_save: Capabilities.voicemail,
+        Capabilities.voicemail_trash: Capabilities.voicemail,
+        Capabilities.voicemail_forward: Capabilities.voicemail,
+    }
     # what our adapter can do in general (what is coded)
     # should be overridden in the sub-class
     CAPABILITIES = []
@@ -160,7 +169,12 @@ class BSSAdapter(SessionManagement, OTPHandler,
     def calculate_capabilities(self) -> List:
         """Calculate the adapter capabilities based on it's settings and config options"""
 
-        capabilities = self.CAPABILITIES
+        # A copy: the loop below appends to and removes from this list, and doing that
+        # to the class attribute leaked between calls. PortaSwitchAdapter calls this
+        # twice - once in __init__, once in initialize() - so a capability the config
+        # disabled was gone from the class list by the second call and could never be
+        # switched back on.
+        capabilities = list(self.CAPABILITIES)
         for option, data in self.CONFIG_CAPABILITIES_OPTIONS.items():
             capability_id = data['option']
             if capability_id in self.CAPABILITIES:
@@ -180,7 +194,14 @@ class BSSAdapter(SessionManagement, OTPHandler,
                 else:
                     # disabled - remove it
                     capabilities.remove(capability_id)
-        return list(set(capabilities))
+
+        enabled = set(capabilities)
+        # Drop anything whose parent capability did not survive the config.
+        enabled -= {
+            capability for capability, required in self.CAPABILITY_DEPENDENCIES.items()
+            if capability in enabled and required not in enabled
+        }
+        return list(enabled)
 
     def __init__(self, config: AppConfig):
         self.config = config
