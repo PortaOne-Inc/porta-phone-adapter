@@ -593,6 +593,9 @@ class SupportedEnum(Enum):
     conference = "conference"
     conversation_mute = "conversationMute"
     call_center = "callCenter"
+    voicemail_save = "voicemailSave"
+    voicemail_trash = "voicemailTrash"
+    voicemail_forward = "voicemailForward"
 
 
 class SystemInfoShowResponse(BaseModel):
@@ -603,7 +606,7 @@ class SystemInfoShowResponse(BaseModel):
     name: str
     supported: List[SupportedEnum] = Field(
         ...,
-        description="A list of supported functionalities by the **Adaptee**.\n\nPossible functionalities values:\n* `signup` - supports the creation of new customer accounts\n* `otpSignin` - allows user authorization via One-Time Password (OTP)\n* `passwordSignin` - allows user authorization using login and password\n* `autoProvision` - allows user authorization using config token\n* `recordings` - provides access to call recordings\n* `callHistory` - provides access to call history\n* `extensions` - retrieves the list of other users (contacts)\n* `conference` - allows merging the calls on two or more lines into an audio conference\n* `conversationMute` - allows silencing new-message notifications of a single chat or SMS conversation\n",
+        description="A list of supported functionalities by the **Adaptee**.\n\nPossible functionalities values:\n* `signup` - supports the creation of new customer accounts\n* `otpSignin` - allows user authorization via One-Time Password (OTP)\n* `passwordSignin` - allows user authorization using login and password\n* `autoProvision` - allows user authorization using config token\n* `recordings` - provides access to call recordings\n* `callHistory` - provides access to call history\n* `extensions` - retrieves the list of other users (contacts)\n* `conference` - allows merging the calls on two or more lines into an audio conference\n* `conversationMute` - allows silencing new-message notifications of a single chat or SMS conversation\n* `voicemailSave` - allows keeping a voicemail message out of the new-message list\n* `voicemailTrash` - deleting a voicemail message moves it to a trash it can be restored from\n* `voicemailForward` - allows passing a voicemail message on to another user\n",
     )
     version: str
 
@@ -813,6 +816,14 @@ class VoicemailMessage(BaseModel):
         description="Indicates whether this message has been seen.",
         example=False,
     )
+    saved: Optional[bool] = Field(
+        None,
+        description="""Indicates whether the user kept this message, so it is held out
+of the new-message list until they unsave it.
+
+`null` when the **Adaptee** cannot persist the state.""",
+        example=False,
+    )
 
 
 class VoicemailMessageAttachment(BaseModel):
@@ -847,7 +858,17 @@ class VoicemailMessageDetails(VoicemailMessage):
 
 
 class UserVoicemailMessagePatch(BaseModel):
-    seen: bool
+    """Attributes to change on a single voicemail message.
+
+    Every field is optional and only the ones present in the request are applied, so a
+    patch that omits `seen` must not be read as "mark unseen". A field sent as `null`
+    counts as omitted, because clients that serialise unset optionals as null are
+    common and reading such a null as false would clear a flag nobody mentioned.
+    The response echoes just the fields that were changed.
+    """
+
+    seen: Optional[bool] = None
+    saved: Optional[bool] = None
 
 
 class UserVoicemailsResponse(BaseModel):
@@ -943,6 +964,13 @@ class UserVoicemailMessagePatchInternalServerErrorResponse(ErrorResponse):
     code: Optional[str] = Field(
         None,
         description="`code` field values that are defined (but can be expanded) are:\n- `external_api_issue`",
+    )
+
+
+class UserVoicemailMessagePatchNotImplementedErrorResponse(ErrorResponse):
+    code: Optional[str] = Field(
+        None,
+        description="`code` field values that are defined (but can be expanded) are:\n- `functionality_not_implemented`",
     )
 
 

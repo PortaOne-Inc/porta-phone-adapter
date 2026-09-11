@@ -311,6 +311,9 @@ class Serializer:
             size=mailbox_message["size"],
             date=datetime.strptime(mailbox_message["delivery_date"], "%d-%b-%Y %H:%M:%S %z"),
             seen=f"\\{PortaSwitchMailboxMessageFlag.SEEN.value}" in mailbox_message.get("flags", []),
+            # The mailbox has no folders, so "saved" is carried by the IMAP \Flagged
+            # flag - the only free flag PortaBilling lets us set (WT-1878).
+            saved=f"\\{PortaSwitchMailboxMessageFlag.FLAGGED.value}" in mailbox_message.get("flags", []),
         )
 
     @staticmethod
